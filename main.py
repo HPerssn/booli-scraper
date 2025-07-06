@@ -76,7 +76,7 @@ def scrape_listings(location_id, max_pages=4):
     }
     listings = []
     for page in range(1, max_pages + 1):
-        url = f"https://www.booli.se/sok/slutpriser?areaIds={location_id}&page={page}"
+        url = f"https://www.booli.se/sok/slutpriser?areaIds={location_id}&objectType=Lägenhet&page={page}"
         try:
             resp = httpx.get(url, headers=headers, timeout=20)
             resp.raise_for_status()
