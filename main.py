@@ -6,6 +6,10 @@ import random
 import datetime
 import csv
 import re
+import json
+from db_utils import export_listings_to_sqlite
+import asyncio
+import logging
 
 today = datetime.date.today()
 
@@ -13,13 +17,16 @@ today = datetime.date.today()
 class Listing:
     address: str
     price: int | None
-    pris_per_kvm: int | None
-    rum: int | None
-    van: int | None
-    kvm: int | None
+    price_per_sqm: int | None
+    rooms: int | None
+    floor: int | None
+    sqm: int | None
     date: str | None
-    kvm_tomt: int | None = None
+    lot_sqm: int | None = None
     housing_type: str | None = None
+    monthly_fee: int | None = None
+    build_year: int | None = None
+    starting_price: int | None = None
 
 
 def clean_value(text, value_type=None):
@@ -51,54 +58,122 @@ def extract_listing(item):
     preamble = get_text(".object-card__preamble")
     housing_type = preamble.split("·")[0].strip().capitalize() if preamble else None
 
-    kvm = rum = van = pris_per_kvm = kvm_tomt = None
+    sqm = rooms = floor = price_per_sqm = lot_sqm = None
     data_list = item.css_first(".object-card__data-list")
     if data_list:
         for li in data_list.css("li"):
             aria = li.attributes.get("aria-label", "")
             text = li.text().strip()
             if "kvadratmeter" in aria and "tomt" in aria:
-                kvm_tomt = clean_value(text, "kvm_tomt")
+                lot_sqm = clean_value(text, "kvm_tomt")
             elif "kvadratmeter" in aria and "kr" not in aria:
-                kvm = clean_value(text, "kvm")
+                sqm = clean_value(text, "kvm")
             elif "rum" in aria:
-                rum = clean_value(text, "rum")
+                rooms = clean_value(text, "rum")
             elif "vån" in aria:
-                van = clean_value(text, "van")
+                floor = clean_value(text, "van")
             elif "kr/kvadratmeter" in aria or "kr/m²" in text:
-                pris_per_kvm = clean_value(text, "pris_per_kvm")
+                price_per_sqm = clean_value(text, "pris_per_kvm")
 
-    return Listing(address, price, pris_per_kvm, rum, van, kvm, date, kvm_tomt, housing_type)
+    return Listing(address, price, price_per_sqm, rooms, floor, sqm, date, lot_sqm, housing_type)
 
-def scrape_listings(location_id, max_pages=4):
+def extract_booli_detail_data(html):
+    # Extract the __NEXT_DATA__ JSON
+    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
+    if not match:
+        return None, None, None
+    data = json.loads(match.group(1))
+    try:
+        sold_property = data["props"]["pageProps"]["__APOLLO_STATE__"]
+        sold_key = next(k for k in sold_property if k.startswith("SoldProperty:"))
+        prop = sold_property[sold_key]
+        monthly_fee = prop.get("rent", {}).get("raw")
+        build_year = prop.get("constructionYear")
+        starting_price = prop.get("listPrice", {}).get("raw")
+        return monthly_fee, build_year, starting_price
+    except Exception as e:
+        print("Extraction error:", e)
+        return None, None, None
+
+def extract_detail_url(item):
+    detail_node = item.css_first(".object-card__header a")
+    if detail_node:
+        href = detail_node.attributes["href"]
+        if href.startswith("http"):
+            return href
+        return f"https://www.booli.se{href}"
+    return None
+
+async def fetch_page(url, headers, client):
+    try:
+        resp = await client.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        print(f"Request failed for {url}: {e}")
+        return None
+
+async def fetch_listing_detail_async(detail_url, headers, client):
+    try:
+        resp = await client.get(detail_url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        return extract_booli_detail_data(resp.text)
+    except Exception as e:
+        print(f"Failed to fetch or parse detail page {detail_url}: {e}")
+        return None, None, None
+
+async def scrape_listings_async(location_id, max_pages=4, concurrency=5):
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
     }
     listings = []
-    for page in range(1, max_pages + 1):
-        url = f"https://www.booli.se/sok/slutpriser?areaIds={location_id}&objectType=Lägenhet&page={page}"
-        try:
-            resp = httpx.get(url, headers=headers, timeout=20)
-            resp.raise_for_status()
-        except Exception as e:
-            print(f"Request failed for page {page}: {e}")
-            continue
-        html = HTMLParser(resp.text)
-        items = html.css("div ul li.search-page__module-container")
-        if not items:
-            break
-        for item in items:
-            listing = extract_listing(item)
-            if listing.address:
-                print(asdict(listing))
-                listings.append(asdict(listing))
-        time.sleep(random.uniform(1, 3))
-    print(f"Named addresses: {len(listings)}")
+    sem = asyncio.Semaphore(concurrency)
+    async with httpx.AsyncClient() as client:
+        page_urls = [f"https://www.booli.se/sok/slutpriser?areaIds={location_id}&objectType=Lägenhet&page={page}" for page in range(1, max_pages + 1)]
+        page_tasks = [fetch_page(url, headers, client) for url in page_urls]
+        logging.info(f"Starting to fetch {max_pages} pages...")
+        page_results = await asyncio.gather(*page_tasks)
+        for idx, page_html in enumerate(page_results, 1):
+            if not page_html:
+                continue
+            html = HTMLParser(page_html)
+            items = html.css("div ul li.search-page__module-container")
+            if not items:
+                continue
+            detail_tasks = []
+            for item in items:
+                listing = extract_listing(item)
+                if not listing.address:
+                    continue
+                listing_dict = asdict(listing)
+                detail_url = extract_detail_url(item)
+                if detail_url:
+                    async def fetch_and_update(listing_dict=listing_dict, detail_url=detail_url):
+                        async with sem:
+                            monthly_fee, build_year, starting_price = await fetch_listing_detail_async(detail_url, headers, client)
+                            listing_dict["monthly_fee"] = monthly_fee
+                            listing_dict["build_year"] = build_year
+                            listing_dict["starting_price"] = starting_price
+                            listings.append(listing_dict)
+                    detail_tasks.append(fetch_and_update())
+                else:
+                    listings.append(listing_dict)
+            await asyncio.gather(*detail_tasks)
+            if idx % 100 == 0:
+                logging.info(f"Processed {idx} pages out of {max_pages}")
+    logging.info(f"Total listings scraped: {len(listings)}")
     return listings
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
     location = "Malmö"
     if location == "Malmö":
         location = 78
-    listings = scrape_listings(location, max_pages=4)
-    export_listings_to_csv(listings)
+    try:
+        listings = asyncio.run(scrape_listings_async(location, max_pages=1, concurrency=5))
+        export_listings_to_sqlite(listings)
+    except KeyboardInterrupt:
+        logging.warning("Scraper stopped by user.")
