@@ -10,6 +10,7 @@ import json
 from db_utils import export_listings_to_sqlite
 import asyncio
 import logging
+import sys
 
 today = datetime.date.today()
 
@@ -27,6 +28,7 @@ class Listing:
     monthly_fee: int | None = None
     build_year: int | None = None
     starting_price: int | None = None
+    page: int | None = None  # Track which page this listing was scraped from
 
 
 def clean_value(text, value_type=None):
@@ -104,14 +106,27 @@ def extract_detail_url(item):
         return f"https://www.booli.se{href}"
     return None
 
+
+async def fetch_with_retries(request_func, url, headers, client, max_retries=5):
+    for attempt in range(max_retries):
+        try:
+            resp = await request_func(url, headers=headers, timeout=20)
+            if resp.status_code == 202:
+                wait = 2 + attempt * 2
+                print(f"202 Accepted for {url}, retrying in {wait}s (attempt {attempt+1}/{max_retries})...")
+                await asyncio.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp.text
+        except Exception as e:
+            print(f"Request failed for {url}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 + attempt * 2)
+            else:
+                return None
+
 async def fetch_page(url, headers, client):
-    try:
-        resp = await client.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
-        return resp.text
-    except Exception as e:
-        print(f"Request failed for {url}: {e}")
-        return None
+    return await fetch_with_retries(client.get, url, headers, client)
 
 async def fetch_listing_detail_async(detail_url, headers, client):
     try:
@@ -129,11 +144,21 @@ async def scrape_listings_async(location_id, max_pages=4, concurrency=5):
     listings = []
     sem = asyncio.Semaphore(concurrency)
     async with httpx.AsyncClient() as client:
-        page_urls = [f"https://www.booli.se/sok/slutpriser?areaIds={location_id}&objectType=Lägenhet&page={page}" for page in range(1, max_pages + 1)]
-        page_tasks = [fetch_page(url, headers, client) for url in page_urls]
-        logging.info(f"Starting to fetch {max_pages} pages...")
-        page_results = await asyncio.gather(*page_tasks)
-        for idx, page_html in enumerate(page_results, 1):
+        def get_page_range(start_page, max_pages):
+            return range(start_page, max_pages + 1)
+        # Accept a start_page argument
+        start_page = getattr(scrape_listings_async, 'start_page', 1)
+        page_urls = [f"https://www.booli.se/sok/slutpriser?areaIds={location_id}&objectType=Lägenhet&page={page}" for page in get_page_range(start_page, max_pages)]
+        logging.info(f"Starting to fetch pages {start_page} to {max_pages}...")
+        page_results = []
+        # Fetch each page with a random delay to avoid being blocked
+        for url in page_urls:
+            html = await fetch_page(url, headers, client)
+            page_results.append(html)
+            delay = random.uniform(0.3, 1.2)  #delay
+            logging.info(f"Sleeping {delay:.2f}s before next page request...")
+            await asyncio.sleep(delay)
+        for idx, page_html in enumerate(page_results, start_page):
             if not page_html:
                 continue
             html = HTMLParser(page_html)
@@ -146,10 +171,12 @@ async def scrape_listings_async(location_id, max_pages=4, concurrency=5):
                 if not listing.address:
                     continue
                 listing_dict = asdict(listing)
+                listing_dict["page"] = idx  # Track which page this listing came from
                 detail_url = extract_detail_url(item)
                 if detail_url:
                     async def fetch_and_update(listing_dict=listing_dict, detail_url=detail_url):
                         async with sem:
+                            await asyncio.sleep(random.uniform(0.1, 1.0))
                             monthly_fee, build_year, starting_price = await fetch_listing_detail_async(detail_url, headers, client)
                             listing_dict["monthly_fee"] = monthly_fee
                             listing_dict["build_year"] = build_year
@@ -158,7 +185,15 @@ async def scrape_listings_async(location_id, max_pages=4, concurrency=5):
                     detail_tasks.append(fetch_and_update())
                 else:
                     listings.append(listing_dict)
-            await asyncio.gather(*detail_tasks)
+            # Batch detail tasks in groups of 5, with a pause between batches
+            batch_size = 5
+            for i in range(0, len(detail_tasks), batch_size):
+                batch = detail_tasks[i:i+batch_size]
+                await asyncio.gather(*batch)
+                if i + batch_size < len(detail_tasks):
+                    pause = random.uniform(5, 10)
+                    logging.info(f"Batch pause: sleeping {pause:.2f}s before next batch of detail fetches...")
+                    await asyncio.sleep(pause)
             if idx % 100 == 0:
                 logging.info(f"Processed {idx} pages out of {max_pages}")
     logging.info(f"Total listings scraped: {len(listings)}")
@@ -172,8 +207,19 @@ if __name__ == "__main__":
     location = "Malmö"
     if location == "Malmö":
         location = 78
+
+    start_page = 1
+    if len(sys.argv) > 1:
+        try:
+            start_page = int(sys.argv[1])
+        except Exception:
+            
+            logging.warning("Invalid start_page argument, defaulting to 1.")
+    # Pass start_page to the async function via attribute
+    setattr(scrape_listings_async, 'start_page', start_page)
     try:
-        listings = asyncio.run(scrape_listings_async(location, max_pages=1, concurrency=5))
+        listings = asyncio.run(scrape_listings_async(location, max_pages=924, concurrency=3))
         export_listings_to_sqlite(listings)
+        #export_listings_to_csv(listings)
     except KeyboardInterrupt:
         logging.warning("Scraper stopped by user.")
